@@ -8,7 +8,10 @@ ASFLAGS = $(CFLAGS)
 
 LIBDIR =
 LDFLAGS =
-LIBS = -lpspgu -lpspgum -lpspaudio -lm
+LIBS = -lpspgu -lpspgum -lpspaudio -lvorbisfile -lvorbis -logg -lm
+
+BUILD_PRX = 1
+PSP_FW_VERSION = 660
 
 EXTRA_TARGETS = EBOOT.PBP
 PSP_EBOOT_TITLE = PSP Game Demo

@@ -6,6 +6,8 @@
 #include <pspgum.h>
 #include <psprtc.h>
 #include <pspaudio.h>
+#include <pspiofilemgr.h>
+#include <vorbis/vorbisfile.h>
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
@@ -33,6 +35,18 @@ typedef enum {
     ENEMY_TANK,      // Slower, more health, worth more points
     ENEMY_SPEEDSTER  // Fast, erratic movement, less health
 } EnemyType;
+
+// Game states
+typedef enum {
+    STATE_PLAYING,
+    STATE_CONFIG_MENU,
+    STATE_GAME_OVER
+} GameState;
+
+// Configuration
+typedef struct {
+    int musicVolume;  // 0-10, default 8
+} Config;
 
 static unsigned int __attribute__((aligned(16))) list[262144];
 
@@ -80,7 +94,8 @@ typedef struct {
     Particle particles[MAX_PARTICLES];
     int score, enemyTimer, shootTimer;
     float time;
-    int gameOver;
+    GameState state;
+    Config config;
 } Game;
 
 // Audio system
@@ -91,7 +106,18 @@ typedef struct {
     int playing;
 } Sound;
 
+typedef struct {
+    OggVorbis_File vf;
+    int isOpen;
+    volatile int playing;
+    volatile int volume;        // 0-10
+    short decodeBuf[4096];      // 2048 stereo samples
+    int decodeBufPos;
+    int decodeBufLen;
+} Music;
+
 static Sound shootSound = {0};
+static Music bgMusic = {0};
 static int audioChannel = -1;
 static volatile int audioRunning = 1;
 
@@ -111,6 +137,107 @@ int SetupCallbacks(void) {
     int thid = sceKernelCreateThread("update_thread", CallbackThread, 0x11, 0xFA0, 0, 0);
     if(thid >= 0) sceKernelStartThread(thid, 0, 0);
     return thid;
+}
+
+// OGG Vorbis file I/O callbacks for PSP
+static size_t ogg_read_func(void *ptr, size_t size, size_t nmemb, void *datasource) {
+    SceUID fd = (SceUID)(intptr_t)datasource;
+    return sceIoRead(fd, ptr, size * nmemb);
+}
+
+static int ogg_seek_func(void *datasource, ogg_int64_t offset, int whence) {
+    SceUID fd = (SceUID)(intptr_t)datasource;
+    return (sceIoLseek(fd, (SceOff)offset, whence) >= 0) ? 0 : -1;
+}
+
+static int ogg_close_func(void *datasource) {
+    SceUID fd = (SceUID)(intptr_t)datasource;
+    return sceIoClose(fd);
+}
+
+static long ogg_tell_func(void *datasource) {
+    SceUID fd = (SceUID)(intptr_t)datasource;
+    return (long)sceIoLseek(fd, 0, SEEK_CUR);
+}
+
+static ov_callbacks oggCallbacks = {
+    ogg_read_func,
+    ogg_seek_func,
+    ogg_close_func,
+    ogg_tell_func
+};
+
+// Load and initialize OGG music file for streaming
+int loadMusic(const char* filename) {
+    SceUID fd = sceIoOpen(filename, PSP_O_RDONLY, 0777);
+    if (fd < 0) return -1;
+
+    if (ov_open_callbacks((void*)(intptr_t)fd, &bgMusic.vf, NULL, 0, oggCallbacks) < 0) {
+        sceIoClose(fd);
+        return -1;
+    }
+
+    bgMusic.isOpen = 1;
+    bgMusic.playing = 1;
+    bgMusic.volume = 8;  // Default 80%
+    bgMusic.decodeBufPos = 0;
+    bgMusic.decodeBufLen = 0;
+
+    return 0;
+}
+
+// Stream decoded OGG samples into buffer with volume scaling
+int streamMusic(short* outBuffer, int samples) {
+    if (!bgMusic.isOpen || !bgMusic.playing) {
+        memset(outBuffer, 0, samples * 4);
+        return 0;
+    }
+
+    int samplesWritten = 0;
+    int bitstream;
+
+    while (samplesWritten < samples) {
+        // Refill decode buffer if empty
+        if (bgMusic.decodeBufPos >= bgMusic.decodeBufLen) {
+            int bytesRead = ov_read(&bgMusic.vf, (char*)bgMusic.decodeBuf,
+                                    sizeof(bgMusic.decodeBuf), 0, 2, 1, &bitstream);
+
+            if (bytesRead <= 0) {
+                // End of file - loop the music
+                ov_raw_seek(&bgMusic.vf, 0);
+                continue;
+            }
+
+            bgMusic.decodeBufLen = bytesRead / 4;  // 4 bytes per stereo sample
+            bgMusic.decodeBufPos = 0;
+        }
+
+        // Copy available samples to output with volume scaling
+        int available = bgMusic.decodeBufLen - bgMusic.decodeBufPos;
+        int toCopy = (samples - samplesWritten < available) ?
+                     (samples - samplesWritten) : available;
+
+        // Volume: 0-10 maps to 0-32760 (PSP_AUDIO_VOLUME_MAX is 0x8000)
+        int volumeScale = bgMusic.volume * 3276;
+
+        for (int i = 0; i < toCopy * 2; i++) {  // *2 for stereo (L+R)
+            int sample = bgMusic.decodeBuf[(bgMusic.decodeBufPos * 2) + i];
+            sample = (sample * volumeScale) >> 15;
+            outBuffer[(samplesWritten * 2) + i] = (short)sample;
+        }
+
+        bgMusic.decodeBufPos += toCopy;
+        samplesWritten += toCopy;
+    }
+
+    return samplesWritten;
+}
+
+// Set music volume (0-10)
+void setMusicVolume(int volume) {
+    if (volume < 0) volume = 0;
+    if (volume > 10) volume = 10;
+    bgMusic.volume = volume;
 }
 
 // Load WAV file (PCM 16-bit stereo 44100Hz)
@@ -152,19 +279,28 @@ int loadWav(const char* filename, Sound* sound) {
     return -1;
 }
 
-// Audio thread
+// Audio thread - mixes background music and sound effects
 int audioThread(SceSize args, void* argp) {
-    short buffer[2048 * 2];  // Stereo buffer
+    short buffer[2048 * 2];  // Final output buffer (stereo)
 
     while (audioRunning) {
-        memset(buffer, 0, sizeof(buffer));
+        // Stream background music into buffer
+        streamMusic(buffer, 2048);
 
+        // Mix shoot sound effect on top of music
         if (shootSound.playing && shootSound.data) {
             int remaining = shootSound.samples - shootSound.position;
             int toPlay = (remaining > 2048) ? 2048 : remaining;
 
             if (toPlay > 0) {
-                memcpy(buffer, &shootSound.data[shootSound.position * 2], toPlay * 4);
+                // Mix SFX by adding to buffer with clamping
+                for (int i = 0; i < toPlay * 2; i++) {
+                    int mixed = buffer[i] + shootSound.data[(shootSound.position * 2) + i];
+                    // Clamp to prevent overflow
+                    if (mixed > 32767) mixed = 32767;
+                    if (mixed < -32768) mixed = -32768;
+                    buffer[i] = (short)mixed;
+                }
                 shootSound.position += toPlay;
             }
 
@@ -185,6 +321,7 @@ void initAudio(void) {
     if (audioChannel < 0) return;
 
     loadWav("shoot_1.wav", &shootSound);
+    loadMusic("background.ogg");
 
     int thid = sceKernelCreateThread("audio_thread", audioThread, 0x12, 0x10000, 0, 0);
     if (thid >= 0) {
@@ -211,7 +348,9 @@ void initGame(Game* g) {
     for(i = 0; i < MAX_ENEMIES; i++) g->enemies[i].active = 0;
     for(i = 0; i < MAX_ENEMY_BULLETS; i++) g->enemyBullets[i].active = 0;
     for(i = 0; i < MAX_PARTICLES; i++) g->particles[i].active = 0;
-    g->score = 0; g->enemyTimer = 0; g->shootTimer = 0; g->time = 0; g->gameOver = 0;
+    g->score = 0; g->enemyTimer = 0; g->shootTimer = 0; g->time = 0;
+    g->state = STATE_PLAYING;
+    g->config.musicVolume = 8;  // Default 80%
 }
 
 void shootBullet(Game* g) {
@@ -432,7 +571,7 @@ void updateGame(Game* g) {
                 g->enemyBullets[i].active = 0;
                 g->player.health--;
                 if(g->player.health <= 0) {
-                    g->gameOver = 1;
+                    g->state = STATE_GAME_OVER;
                 }
             }
         }
@@ -449,7 +588,7 @@ void updateGame(Game* g) {
                 g->player.health--;
                 explode(g, g->enemies[i].x, g->enemies[i].y, g->enemies[i].z);
                 if(g->player.health <= 0) {
-                    g->gameOver = 1;
+                    g->state = STATE_GAME_OVER;
                 }
             }
         }
@@ -693,6 +832,53 @@ void drawEnemy(Enemy* e) {
     }
 }
 
+// Handle config menu input
+void handleConfigMenuInput(Game* g, SceCtrlData* pad, SceCtrlData* oldPad) {
+    // LEFT: decrease volume
+    if ((pad->Buttons & PSP_CTRL_LEFT) && !(oldPad->Buttons & PSP_CTRL_LEFT)) {
+        if (g->config.musicVolume > 0) {
+            g->config.musicVolume--;
+            setMusicVolume(g->config.musicVolume);
+        }
+    }
+    // RIGHT: increase volume
+    if ((pad->Buttons & PSP_CTRL_RIGHT) && !(oldPad->Buttons & PSP_CTRL_RIGHT)) {
+        if (g->config.musicVolume < 10) {
+            g->config.musicVolume++;
+            setMusicVolume(g->config.musicVolume);
+        }
+    }
+    // X to close menu
+    if ((pad->Buttons & PSP_CTRL_CROSS) && !(oldPad->Buttons & PSP_CTRL_CROSS)) {
+        g->state = STATE_PLAYING;
+    }
+}
+
+// Draw config menu overlay
+void drawConfigMenu(Game* g) {
+    pspDebugScreenSetXY(14, 8);
+    pspDebugScreenSetBackColor(0xC0000000);
+    pspDebugScreenSetTextColor(0xFFFFFFFF);
+    printf("===== CONFIG =====\n");
+
+    pspDebugScreenSetXY(14, 10);
+    printf("Music Volume: [");
+    for (int i = 0; i < 10; i++) {
+        if (i < g->config.musicVolume) {
+            printf("=");
+        } else {
+            printf("-");
+        }
+    }
+    printf("] %d/10\n", g->config.musicVolume);
+
+    pspDebugScreenSetXY(14, 13);
+    pspDebugScreenSetTextColor(0xFF00FFFF);  // Yellow
+    printf("LEFT/RIGHT: Adjust Volume\n");
+    pspDebugScreenSetXY(14, 14);
+    printf("SELECT or X: Close Menu");
+}
+
 int main(void) {
     SetupCallbacks();
     initAudio();
@@ -744,29 +930,47 @@ int main(void) {
         sceCtrlReadBufferPositive(&pad, 1);
         if(pad.Buttons & PSP_CTRL_START) break;
 
-        if(game.gameOver) {
-            // Game Over - only allow restart
-            if((pad.Buttons & PSP_CTRL_CROSS) && !(oldPad.Buttons & PSP_CTRL_CROSS)) {
-                initGame(&game);
+        // Toggle config menu with SELECT (only when playing or in config)
+        if ((pad.Buttons & PSP_CTRL_SELECT) && !(oldPad.Buttons & PSP_CTRL_SELECT)) {
+            if (game.state == STATE_PLAYING) {
+                game.state = STATE_CONFIG_MENU;
+            } else if (game.state == STATE_CONFIG_MENU) {
+                game.state = STATE_PLAYING;
             }
-        } else {
-            // Normal gameplay
-            // Input
-            if(pad.Buttons & PSP_CTRL_UP && game.player.y < 1.5f) game.player.y += 0.06f;
-            if(pad.Buttons & PSP_CTRL_DOWN && game.player.y > -1.5f) game.player.y -= 0.06f;
-            if(pad.Buttons & PSP_CTRL_LEFT && game.player.x > -3.0f) game.player.x -= 0.08f;
-            if(pad.Buttons & PSP_CTRL_RIGHT && game.player.x < 3.0f) game.player.x += 0.08f;
-            if((pad.Buttons & PSP_CTRL_CROSS) && !(oldPad.Buttons & PSP_CTRL_CROSS)) shootBullet(&game);
+        }
 
-            // Spawn enemies (faster as score increases)
-            int spawnRate = 80 - (game.score / 50);
-            if(spawnRate < 30) spawnRate = 30;
-            if(++game.enemyTimer > spawnRate) {
-                spawnEnemy(&game);
-                game.enemyTimer = 0;
-            }
+        // State-based input handling
+        switch (game.state) {
+            case STATE_PLAYING:
+                // Normal gameplay input
+                if(pad.Buttons & PSP_CTRL_UP && game.player.y < 1.5f) game.player.y += 0.06f;
+                if(pad.Buttons & PSP_CTRL_DOWN && game.player.y > -1.5f) game.player.y -= 0.06f;
+                if(pad.Buttons & PSP_CTRL_LEFT && game.player.x > -3.0f) game.player.x -= 0.08f;
+                if(pad.Buttons & PSP_CTRL_RIGHT && game.player.x < 3.0f) game.player.x += 0.08f;
+                if((pad.Buttons & PSP_CTRL_CROSS) && !(oldPad.Buttons & PSP_CTRL_CROSS)) shootBullet(&game);
 
-            updateGame(&game);
+                // Spawn enemies (faster as score increases)
+                int spawnRate = 80 - (game.score / 50);
+                if(spawnRate < 30) spawnRate = 30;
+                if(++game.enemyTimer > spawnRate) {
+                    spawnEnemy(&game);
+                    game.enemyTimer = 0;
+                }
+
+                updateGame(&game);
+                break;
+
+            case STATE_CONFIG_MENU:
+                // Config menu input (game paused)
+                handleConfigMenuInput(&game, &pad, &oldPad);
+                break;
+
+            case STATE_GAME_OVER:
+                // Game over - X to restart
+                if((pad.Buttons & PSP_CTRL_CROSS) && !(oldPad.Buttons & PSP_CTRL_CROSS)) {
+                    initGame(&game);
+                }
+                break;
         }
 
         // Render
@@ -835,13 +1039,18 @@ int main(void) {
         pspDebugScreenSetXY(0, 0);
         pspDebugScreenSetBackColor(0x80000000);
         pspDebugScreenSetTextColor(0xFFFFFFFF);
-        if(game.gameOver) {
+        if(game.state == STATE_GAME_OVER) {
             printf("GAME OVER!\n");
             printf("Final Score: %d\n", game.score);
             printf("Press X to Restart | START=Exit");
         } else {
-            printf("Score: %d | Health: %d\n", game.score, game.player.health);
-            printf("D-Pad=Move X=Shoot START=Exit");
+            printf("Score: %d | Health: %d | Vol: %d/10\n", game.score, game.player.health, game.config.musicVolume);
+            printf("D-Pad=Move X=Shoot SELECT=Config START=Exit");
+        }
+
+        // Draw config menu overlay if active
+        if (game.state == STATE_CONFIG_MENU) {
+            drawConfigMenu(&game);
         }
 
         // Debug info
