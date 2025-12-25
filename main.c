@@ -856,27 +856,21 @@ void handleConfigMenuInput(Game* g, SceCtrlData* pad, SceCtrlData* oldPad) {
 
 // Draw config menu overlay
 void drawConfigMenu(Game* g) {
-    pspDebugScreenSetXY(14, 8);
-    pspDebugScreenSetBackColor(0xC0000000);
-    pspDebugScreenSetTextColor(0xFFFFFFFF);
-    printf("===== CONFIG =====\n");
-
-    pspDebugScreenSetXY(14, 10);
+    // Draw menu at top of screen for better visibility
+    pspDebugScreenSetXY(0, 4);
+    pspDebugScreenSetTextColor(0xFF00FFFF);  // Yellow/Cyan
+    printf("========== CONFIG MENU ==========\n");
+    pspDebugScreenSetXY(0, 5);
+    pspDebugScreenSetTextColor(0xFFFFFFFF);  // White
     printf("Music Volume: [");
     for (int i = 0; i < 10; i++) {
-        if (i < g->config.musicVolume) {
-            printf("=");
-        } else {
-            printf("-");
-        }
+        printf(i < g->config.musicVolume ? "=" : "-");
     }
     printf("] %d/10\n", g->config.musicVolume);
-
-    pspDebugScreenSetXY(14, 13);
-    pspDebugScreenSetTextColor(0xFF00FFFF);  // Yellow
-    printf("LEFT/RIGHT: Adjust Volume\n");
-    pspDebugScreenSetXY(14, 14);
-    printf("SELECT or X: Close Menu");
+    pspDebugScreenSetXY(0, 7);
+    pspDebugScreenSetTextColor(0xFF00FF00);  // Green
+    printf("LEFT/RIGHT=Volume  SELECT/X=Close\n");
+    printf("=================================");
 }
 
 int main(void) {
@@ -1043,14 +1037,21 @@ int main(void) {
             printf("GAME OVER!\n");
             printf("Final Score: %d\n", game.score);
             printf("Press X to Restart | START=Exit");
+        } else if (game.state == STATE_CONFIG_MENU) {
+            // Config menu - draw in HUD area where text definitely works
+            pspDebugScreenSetTextColor(0xFF00FFFF);  // Cyan
+            printf("=== CONFIG MENU ===\n");
+            pspDebugScreenSetTextColor(0xFFFFFFFF);
+            printf("Music Volume: [");
+            for (int i = 0; i < 10; i++) {
+                printf(i < game.config.musicVolume ? "=" : "-");
+            }
+            printf("] %d/10\n", game.config.musicVolume);
+            pspDebugScreenSetTextColor(0xFF00FF00);  // Green
+            printf("LEFT/RIGHT=Adjust  SELECT/X=Close");
         } else {
             printf("Score: %d | Health: %d | Vol: %d/10\n", game.score, game.player.health, game.config.musicVolume);
             printf("D-Pad=Move X=Shoot SELECT=Config START=Exit");
-        }
-
-        // Draw config menu overlay if active
-        if (game.state == STATE_CONFIG_MENU) {
-            drawConfigMenu(&game);
         }
 
         // Debug info
@@ -1058,9 +1059,11 @@ int main(void) {
         countEntities(&game, &enemyCount, &bulletCount, &eBulletCount, &particleCount);
         pspDebugScreenSetXY(0, 30);
         pspDebugScreenSetTextColor(0xFF00FF00);  // Green
-        printf("FPS: %.1f | Pos: (%.2f, %.2f, %.2f)\n", fps, game.player.x, game.player.y, game.player.z);
-        printf("Enemies: %d | Bullets: %d | EBullets: %d | Particles: %d",
-               enemyCount, bulletCount, eBulletCount, particleCount);
+        const char* stateStr = (game.state == STATE_PLAYING) ? "PLAY" :
+                               (game.state == STATE_CONFIG_MENU) ? "CONFIG" : "GAMEOVER";
+        printf("FPS: %.1f | State: %s\n", fps, stateStr);
+        printf("Enemies: %d | Bullets: %d | Particles: %d",
+               enemyCount, bulletCount, particleCount);
 
         sceDisplayWaitVblankStart();
         sceGuSwapBuffers();
