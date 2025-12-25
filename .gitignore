@@ -1,0 +1,24 @@
+# PSP Build artifacts
+*.o
+*.elf
+*.sfo
+*.prx
+EBOOT.PBP
+PARAM.SFO
+*.bin
+
+# General build files
+*.d
+*.a
+*.so
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

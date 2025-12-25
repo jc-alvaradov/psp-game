@@ -1,0 +1,37 @@
+name: Build PSP Game
+
+on:
+  push:
+    branches: [ main, master, claude/** ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: pspdev/pspdev:latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Build PSP game
+      run: |
+        make clean
+        make
+
+    - name: Upload EBOOT.PBP
+      uses: actions/upload-artifact@v4
+      with:
+        name: psp-game-eboot
+        path: EBOOT.PBP
+        if-no-files-found: error
+
+    - name: Create release info
+      run: |
+        echo "Build completed successfully!"
+        echo "Game: PSP Game Demo"
+        echo "File: EBOOT.PBP"
+        ls -lh EBOOT.PBP
