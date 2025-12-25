@@ -218,6 +218,12 @@ make clean
 
 This is a demonstration project for educational purposes.
 
+## Credits
+
+### Audio Assets
+
+- **shoot_1.wav** - "4 projectile launches" by Michel Baradari ([apollo-music.de](http://apollo-music.de)), licensed under [CC-BY 3.0](https://creativecommons.org/licenses/by/3.0/). Source: [OpenGameArt.org](https://opengameart.org/content/4-projectile-launches)
+
 ## Resources
 
 - [PSP Development Wiki](https://github.com/pspdev/pspdev)
